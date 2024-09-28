@@ -74,6 +74,7 @@ source=("${_url}/llvm-${pkgver}.src.tar.xz"{,.sig}
         # 0101-0199 -> clang
         "0101-link-pthread-with-mingw.patch"
         "0102-Rename-flang-new-flang-experimental-exec-to-flang.patch"
+        "0103-Stub-out-gcc_struct-attribute.patch"
         # 0201-0299 -> rt
         # 0301-0399 -> lld
         "0303-ignore-new-bfd-options.patch"
@@ -99,6 +100,7 @@ sha256sums=('f68cf90f369bc7d0158ba70d860b0cb34dbc163d6ff0ebc6cfa5e515b9b2e28d'
             '5f86e542dd1ec92b2fe06ee59061c3e23512df7bafabe82206f2b7d80b81836b'
             '715cb8862753854b2d9256e0b70003e2d1f57083d83eaeaf5a095fc72b8a4e26'
             '2770cadf8ccf6b31aece6aee8f76dceb71e6e9d01fdf3be74c3743480ce34899'
+            '53c1ae4c22b34f5acc7a2aec3c161ee0b27bf4807448de6aa53c079e15dee18b'
             'fd0253879cc5e31857f57307e6105e56493358e35d7c4540e0b476be607ab94e')
 validpgpkeys=('B6C8F98282B944E3B0D5C2530FC3042E345AD05D'  # Hans Wennborg, Google.
               '474E22316ABF4785A88C6E8EA2C794A986419D8A'  # Tom Stellard
@@ -153,7 +155,9 @@ prepare() {
   # https://reviews.llvm.org/D143592
   apply_patch_with_msg \
     "0102-Rename-flang-new-flang-experimental-exec-to-flang.patch"
-
+  # https://github.com/llvm/llvm-project/pull/71148
+  apply_patch_with_msg \
+    "0103-Stub-out-gcc_struct-attribute.patch"
   # Patch lld
   cd "${srcdir}"/lld
 

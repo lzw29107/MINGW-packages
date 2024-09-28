@@ -1,0 +1,485 @@
+From 774fda2a1bbb3b90ac0aeab3c8cf943c56ec95dd Mon Sep 17 00:00:00 2001
+From: Dan Klishch <danilklishch@gmail.com>
+Date: Fri, 3 Nov 2023 21:18:06 -0400
+Subject: [PATCH] [clang] Stub out gcc_struct attribute
+
+This commit implements gcc_struct attribute with the behavior similar to
+one in GCC. Current behavior is as follows:
+
+When C++ ABI is not "Microsoft" (i. e. when
+ItaniumRecordLayoutBuilder is used), [[gcc_struct]] will locally cancel
+the effect of -mms-bitfields on a record. If -mms-bitfields is not
+supplied and is not a default behavior on a target, [[gcc_struct]] will
+be a no-op. This should provide enough compatibility with GCC.
+
+If C++ ABI is "Microsoft", [[gcc_struct]] will currently always produce
+a diagnostic, since support for it is not yet implemented in
+MicrosoftRecordLayoutBuilder. Note, however, that all the infrastructure
+is ready for the future implementation.
+
+In particular, check for default value of -mms-bitfields is moved from a
+driver to ASTContext, since it now non-trivially depends on other
+supplied flags. This also, unfortunately, makes it impossible to use
+usual argument parsing for `-m{no-,}ms-bitfields`.
+
+The patch doesn't introduce any backwards-incompatible changes, except
+for situations when cc1 is called directly with `-mms-bitfields` option.
+
+diff --git clang/docs/ReleaseNotes.rst clang/docs/ReleaseNotes.rst
+index e533ecfd5aeb..d00215c1dd80 100644
+--- clang/docs/ReleaseNotes.rst
++++ clang/docs/ReleaseNotes.rst
+@@ -476,6 +476,12 @@ Attribute Changes in Clang
+   returns a type annotated with ``[[clang::coro_lifetimebound]]`` and ``[[clang::coro_return_type]]``.
+   This analysis can be disabled for a function by annotating the function with ``[[clang::coro_disable_lifetimebound]]``.
+ 
++- On targets with Itanium C++ ABI, Clang now supports ``[[gnu:gcc_struct]]``
++  with the behavior similar to one existing in GCC. In particular, whenever
++  ``-mms-bitfields`` command line option is provided (or if Microsoft-compatible
++  structure layout is default on the target), ``[[gnu::gcc_struct]]`` requests
++  the compiler to follow Itanium rules for the layout of an annotated structure.
++
+ Improvements to Clang's diagnostics
+ -----------------------------------
+ - Clang constexpr evaluator now prints template arguments when displaying
+diff --git clang/include/clang/AST/ASTContext.h clang/include/clang/AST/ASTContext.h
+index 3e46a5da3fc0..5c907934452b 100644
+--- clang/include/clang/AST/ASTContext.h
++++ clang/include/clang/AST/ASTContext.h
+@@ -2429,6 +2429,14 @@ public:
+   /// runtime, such as those using the Itanium C++ ABI.
+   CharUnits getExnObjectAlignment() const;
+ 
++  /// Return whether getASTRecordLayout will use MicrosoftRecordLayoutBuilder
++  /// or ItaniumRecordLayoutBuilder.
++  bool isMicrosoftLayout() const;
++
++  /// Return whether unannotated records are treated as if they have
++  /// [[gnu::ms_struct]].
++  bool defaultsToMsStruct() const;
++
+   /// Get or compute information about the layout of the specified
+   /// record (struct/union/class) \p D, which indicates its size and field
+   /// position information.
+diff --git clang/include/clang/Basic/Attr.td clang/include/clang/Basic/Attr.td
+index dbf2dd2120fb..b3b6c0ff6e9a 100644
+--- clang/include/clang/Basic/Attr.td
++++ clang/include/clang/Basic/Attr.td
+@@ -3781,7 +3781,14 @@ def CFGuard : InheritableAttr, TargetSpecificAttr<TargetWindows> {
+ def MSStruct : InheritableAttr {
+   let Spellings = [GCC<"ms_struct">];
+   let Subjects = SubjectList<[Record]>;
+-  let Documentation = [Undocumented];
++  let Documentation = [MSStructDocs];
++  let SimpleHandler = 1;
++}
++
++def GCCStruct : InheritableAttr {
++  let Spellings = [GCC<"gcc_struct">];
++  let Subjects = SubjectList<[Record]>;
++  let Documentation = [MSStructDocs]; // Covers this attribute too.
+   let SimpleHandler = 1;
+ }
+ 
+diff --git clang/include/clang/Basic/AttrDocs.td clang/include/clang/Basic/AttrDocs.td
+index e02a1201e2ad..d2ca4dab0380 100644
+--- clang/include/clang/Basic/AttrDocs.td
++++ clang/include/clang/Basic/AttrDocs.td
+@@ -7878,3 +7878,19 @@ requirement:
+   }
+   }];
+ }
++
++def MSStructDocs : Documentation {
++  let Category = DocCatDecl;
++  let Content = [{
++The ``ms_struct`` and ``gcc_struct`` attributes request the compiler to enter a
++special record layout compatibility mode which mimics the layout of Microsoft or
++Itanium C++ ABI respectively. Obviously, if the current C++ ABI matches the
++requested ABI, the attribute does nothing. However, if it does not, annotated
++structure or class is laid out in a special compatibility mode, which slightly
++changes offsets for fields and bit-fields. The intention is to match the layout
++of the requested ABI for structures which only use C features.
++
++Note that the default behavior can be controlled by ``-mms-bitfields`` and
++``-mno-ms-bitfields`` switches and via ``#pragma ms_struct``.
++  }];
++}
+diff --git clang/include/clang/Basic/DiagnosticASTKinds.td clang/include/clang/Basic/DiagnosticASTKinds.td
+index c81d17ed6410..0346b7fed816 100644
+--- clang/include/clang/Basic/DiagnosticASTKinds.td
++++ clang/include/clang/Basic/DiagnosticASTKinds.td
+@@ -998,6 +998,9 @@ def warn_npot_ms_struct : Warning<
+   "data types with sizes that aren't a power of two">,
+   DefaultError, InGroup<IncompatibleMSStruct>;
+ 
++def err_itanium_layout_unimplemented : Error<
++  "Itanium-compatible layout for the Microsoft C++ ABI is not yet supported">;
++
+ // -Wpadded-bitfield
+ def warn_padded_struct_bitfield : Warning<
+   "padding %select{struct|interface|class}0 %1 with %2 "
+diff --git clang/include/clang/Basic/LangOptions.def clang/include/clang/Basic/LangOptions.def
+index 4942dcaa086e..a39767d74dcb 100644
+--- clang/include/clang/Basic/LangOptions.def
++++ clang/include/clang/Basic/LangOptions.def
+@@ -149,7 +149,8 @@ LANGOPT(AssumeNothrowExceptionDtor , 1, 0, "Assume exception object's destructor
+ LANGOPT(TraditionalCPP    , 1, 0, "traditional CPP emulation")
+ LANGOPT(RTTI              , 1, 1, "run-time type information")
+ LANGOPT(RTTIData          , 1, 1, "emit run-time type information data")
+-LANGOPT(MSBitfields       , 1, 0, "Microsoft-compatible structure layout")
++ENUM_LANGOPT(LayoutCompatibility, LayoutCompatibilityKind, 2,
++             LayoutCompatibilityKind::Default, "Microsoft-compatible structure layout")
+ LANGOPT(MSVolatile        , 1, 0, "Microsoft-compatible volatile loads and stores")
+ LANGOPT(Freestanding, 1, 0, "freestanding implementation")
+ LANGOPT(NoBuiltin         , 1, 0, "disable builtin functions")
+diff --git clang/include/clang/Basic/LangOptions.h clang/include/clang/Basic/LangOptions.h
+index c1cc5548ef10..ed8cb02ee3d6 100644
+--- clang/include/clang/Basic/LangOptions.h
++++ clang/include/clang/Basic/LangOptions.h
+@@ -416,6 +416,16 @@ public:
+ 
+   enum ComplexRangeKind { CX_Full, CX_Limited, CX_Fortran, CX_None };
+ 
++  enum class LayoutCompatibilityKind {
++    /// Use default layout rules of the target.
++    Default = 0,
++    /// Use Itanium rules for bit-field layout and fundamental types alignment.
++    Itanium = 1,
++    /// Use Microsoft C++ ABI rules for bit-field layout and fundamental types
++    /// alignment.
++    Microsoft = 2,
++  };
++
+ public:
+   /// The used language standard.
+   LangStandard::Kind LangStd;
+diff --git clang/include/clang/Driver/Options.td clang/include/clang/Driver/Options.td
+index 175bedbfb4d0..77265af335e6 100644
+--- clang/include/clang/Driver/Options.td
++++ clang/include/clang/Driver/Options.td
+@@ -4494,9 +4494,7 @@ def mmacos_version_min_EQ : Joined<["-"], "mmacos-version-min=">,
+ def : Joined<["-"], "mmacosx-version-min=">,
+   Group<m_Group>, Alias<mmacos_version_min_EQ>;
+ def mms_bitfields : Flag<["-"], "mms-bitfields">, Group<m_Group>,
+-  Visibility<[ClangOption, CC1Option]>,
+-  HelpText<"Set the default structure layout to be compatible with the Microsoft compiler standard">,
+-  MarshallingInfoFlag<LangOpts<"MSBitfields">>;
++  HelpText<"Set the default structure layout to be compatible with the Microsoft compiler standard">;
+ def moutline : Flag<["-"], "moutline">, Group<f_clang_Group>,
+   Visibility<[ClangOption, CC1Option]>,
+     HelpText<"Enable function outlining (AArch64 only)">;
+@@ -4505,6 +4503,12 @@ def mno_outline : Flag<["-"], "mno-outline">, Group<f_clang_Group>,
+     HelpText<"Disable function outlining (AArch64 only)">;
+ def mno_ms_bitfields : Flag<["-"], "mno-ms-bitfields">, Group<m_Group>,
+   HelpText<"Do not set the default structure layout to be compatible with the Microsoft compiler standard">;
++def fms_layout_compatibility_EQ : Joined<["-"], "fms-layout-compatibility=">,
++  Visibility<[CC1Option]>,
++  HelpText<"Structure layout compatibility with Microsoft C++ ABI">,
++  Values<"default,itanium,microsoft">,
++  NormalizedValues<["Default", "Itanium", "Microsoft"]>, NormalizedValuesScope<"LangOptions::LayoutCompatibilityKind">,
++  MarshallingInfoEnum<LangOpts<"LayoutCompatibility">, "Default">;
+ def mskip_rax_setup : Flag<["-"], "mskip-rax-setup">, Group<m_Group>,
+   Visibility<[ClangOption, CC1Option]>,
+   HelpText<"Skip setting up RAX register when passing variable arguments (x86 only)">,
+diff --git clang/lib/AST/Decl.cpp clang/lib/AST/Decl.cpp
+index 1ee33fd7576d..5644343e1802 100644
+--- clang/lib/AST/Decl.cpp
++++ clang/lib/AST/Decl.cpp
+@@ -5037,7 +5037,14 @@ void RecordDecl::completeDefinition() {
+ /// This which can be turned on with an attribute, pragma, or the
+ /// -mms-bitfields command-line option.
+ bool RecordDecl::isMsStruct(const ASTContext &C) const {
+-  return hasAttr<MSStructAttr>() || C.getLangOpts().MSBitfields == 1;
++  if (hasAttr<MSStructAttr>())
++    return true;
++  if (hasAttr<GCCStructAttr>())
++    return false;
++  auto LayoutCompatibility = C.getLangOpts().getLayoutCompatibility();
++  if (LayoutCompatibility == LangOptions::LayoutCompatibilityKind::Default)
++    return C.defaultsToMsStruct();
++  return LayoutCompatibility == LangOptions::LayoutCompatibilityKind::Microsoft;
+ }
+ 
+ void RecordDecl::reorderDecls(const SmallVectorImpl<Decl *> &Decls) {
+diff --git clang/lib/AST/RecordLayoutBuilder.cpp clang/lib/AST/RecordLayoutBuilder.cpp
+index 6dfaadd92e79..f53de2fdc5d7 100644
+--- clang/lib/AST/RecordLayoutBuilder.cpp
++++ clang/lib/AST/RecordLayoutBuilder.cpp
+@@ -2450,10 +2450,6 @@ static bool mustSkipTailPadding(TargetCXXABI ABI, const CXXRecordDecl *RD) {
+   llvm_unreachable("bad tail-padding use kind");
+ }
+ 
+-static bool isMsLayout(const ASTContext &Context) {
+-  return Context.getTargetInfo().getCXXABI().isMicrosoft();
+-}
+-
+ // This section contains an implementation of struct layout that is, up to the
+ // included tests, compatible with cl.exe (2013).  The layout produced is
+ // significantly different than those produced by the Itanium ABI.  Here we note
+@@ -2795,6 +2791,13 @@ void MicrosoftRecordLayoutBuilder::initializeLayout(const RecordDecl *RD) {
+     UseExternalLayout = Source->layoutRecordType(
+         RD, External.Size, External.Align, External.FieldOffsets,
+         External.BaseOffsets, External.VirtualBaseOffsets);
++
++  if (!RD->isMsStruct(Context)) {
++    auto Location = RD->getLocation();
++    if (Location.isValid())
++      Context.getDiagnostics().Report(Location,
++                                      diag::err_itanium_layout_unimplemented);
++  }
+ }
+ 
+ void
+@@ -3316,6 +3319,19 @@ void MicrosoftRecordLayoutBuilder::computeVtorDispSet(
+   }
+ }
+ 
++bool ASTContext::isMicrosoftLayout() const {
++  // Check if it's CUDA device compilation; ensure layout consistency with host.
++  if (getLangOpts().CUDA && getLangOpts().CUDAIsDevice && getAuxTargetInfo())
++    return getAuxTargetInfo()->getCXXABI().isMicrosoft();
++
++  return getTargetInfo().getCXXABI().isMicrosoft();
++}
++
++bool ASTContext::defaultsToMsStruct() const {
++  return isMicrosoftLayout() ||
++         getTargetInfo().getTriple().isWindowsGNUEnvironment();
++}
++
+ /// getASTRecordLayout - Get or compute information about the layout of the
+ /// specified record (struct/union/class), which indicates its size and field
+ /// position information.
+@@ -3344,7 +3360,7 @@ ASTContext::getASTRecordLayout(const RecordDecl *D) const {
+ 
+   const ASTRecordLayout *NewEntry = nullptr;
+ 
+-  if (isMsLayout(*this)) {
++  if (isMicrosoftLayout()) {
+     if (const auto *RD = dyn_cast<CXXRecordDecl>(D)) {
+       EmptySubobjectMap EmptySubobjects(*this, RD);
+       MicrosoftRecordLayoutBuilder Builder(*this, &EmptySubobjects);
+@@ -3620,7 +3636,7 @@ static void DumpRecordLayout(raw_ostream &OS, const RecordDecl *RD,
+     bool HasOwnVBPtr = Layout.hasOwnVBPtr();
+ 
+     // Vtable pointer.
+-    if (CXXRD->isDynamicClass() && !PrimaryBase && !isMsLayout(C)) {
++    if (CXXRD->isDynamicClass() && !PrimaryBase && !C.isMicrosoftLayout()) {
+       PrintOffset(OS, Offset, IndentLevel);
+       OS << '(' << *RD << " vtable pointer)\n";
+     } else if (HasOwnVFPtr) {
+@@ -3720,7 +3736,7 @@ static void DumpRecordLayout(raw_ostream &OS, const RecordDecl *RD,
+ 
+   PrintIndentNoOffset(OS, IndentLevel - 1);
+   OS << "[sizeof=" << Layout.getSize().getQuantity();
+-  if (CXXRD && !isMsLayout(C))
++  if (CXXRD && !C.isMicrosoftLayout())
+     OS << ", dsize=" << Layout.getDataSize().getQuantity();
+   OS << ", align=" << Layout.getAlignment().getQuantity();
+   if (C.getTargetInfo().defaultsToAIXPowerAlignment())
+@@ -3759,7 +3775,7 @@ void ASTContext::DumpRecordLayout(const RecordDecl *RD, raw_ostream &OS,
+   OS << "\nLayout: ";
+   OS << "<ASTRecordLayout\n";
+   OS << "  Size:" << toBits(Info.getSize()) << "\n";
+-  if (!isMsLayout(*this))
++  if (!isMicrosoftLayout())
+     OS << "  DataSize:" << toBits(Info.getDataSize()) << "\n";
+   OS << "  Alignment:" << toBits(Info.getAlignment()) << "\n";
+   if (Target->defaultsToAIXPowerAlignment())
+diff --git clang/lib/Driver/ToolChains/Clang.cpp clang/lib/Driver/ToolChains/Clang.cpp
+index aa344b3465ab..34ad0108d127 100644
+--- clang/lib/Driver/ToolChains/Clang.cpp
++++ clang/lib/Driver/ToolChains/Clang.cpp
+@@ -5662,9 +5662,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+   if (KernelOrKext && RawTriple.isOSDarwin())
+     CmdArgs.push_back("-fforbid-guard-variables");
+ 
+-  if (Args.hasFlag(options::OPT_mms_bitfields, options::OPT_mno_ms_bitfields,
+-                   Triple.isWindowsGNUEnvironment())) {
+-    CmdArgs.push_back("-mms-bitfields");
++  if (Args.hasArg(options::OPT_mms_bitfields) ||
++      Args.hasArg(options::OPT_mno_ms_bitfields)) {
++    if (Args.hasFlag(options::OPT_mms_bitfields, options::OPT_mno_ms_bitfields,
++                     false))
++      CmdArgs.push_back("-fms-layout-compatibility=microsoft");
++    else
++      CmdArgs.push_back("-fms-layout-compatibility=itanium");
+   }
+ 
+   if (Triple.isWindowsGNUEnvironment()) {
+diff --git clang/lib/Sema/SemaDecl.cpp clang/lib/Sema/SemaDecl.cpp
+index f5bb3e0b42e2..31418e0b45a3 100644
+--- clang/lib/Sema/SemaDecl.cpp
++++ clang/lib/Sema/SemaDecl.cpp
+@@ -18398,9 +18398,7 @@ ExprResult Sema::VerifyBitField(SourceLocation FieldLoc,
+     // ABI.
+     bool CStdConstraintViolation =
+         BitfieldIsOverwide && !getLangOpts().CPlusPlus;
+-    bool MSBitfieldViolation =
+-        Value.ugt(TypeStorageSize) &&
+-        (IsMsStruct || Context.getTargetInfo().getCXXABI().isMicrosoft());
++    bool MSBitfieldViolation = Value.ugt(TypeStorageSize) && IsMsStruct;
+     if (CStdConstraintViolation || MSBitfieldViolation) {
+       unsigned DiagWidth =
+           CStdConstraintViolation ? TypeWidth : TypeStorageSize;
+diff --git clang/lib/Sema/SemaDeclCXX.cpp clang/lib/Sema/SemaDeclCXX.cpp
+index df5bd55e7c28..c0570b5e4be4 100644
+--- clang/lib/Sema/SemaDeclCXX.cpp
++++ clang/lib/Sema/SemaDeclCXX.cpp
+@@ -7254,20 +7254,27 @@ void Sema::CheckCompletedCXXClass(Scope *S, CXXRecordDecl *Record) {
+       CheckCompletedMemberFunction(MD);
+   }
+ 
+-  // ms_struct is a request to use the same ABI rules as MSVC.  Check
+-  // whether this class uses any C++ features that are implemented
+-  // completely differently in MSVC, and if so, emit a diagnostic.
+-  // That diagnostic defaults to an error, but we allow projects to
+-  // map it down to a warning (or ignore it).  It's a fairly common
+-  // practice among users of the ms_struct pragma to mass-annotate
+-  // headers, sweeping up a bunch of types that the project doesn't
+-  // really rely on MSVC-compatible layout for.  We must therefore
+-  // support "ms_struct except for C++ stuff" as a secondary ABI.
++  // {ms,gcc}_struct is a request to change ABI rules to either follow
++  // Microsoft or Itanium C++ ABI. However, even if these attributes are
++  // present, we do not layout classes following foreign ABI rules, but
++  // instead enter a special "compatibility mode", which only changes
++  // alignments of fundamental types and layout of bit fields.
++  // Check whether this class uses any C++ features that are implemented
++  // completely differently in the requested ABI, and if so, emit a
++  // diagnostic. That diagnostic defaults to an error, but we allow
++  // projects to map it down to a warning (or ignore it). It's a fairly
++  // common practice among users of the ms_struct pragma to
++  // mass-annotate headers, sweeping up a bunch of types that the
++  // project doesn't really rely on MSVC-compatible layout for. We must
++  // therefore support "ms_struct except for C++ stuff" as a secondary
++  // ABI.
+   // Don't emit this diagnostic if the feature was enabled as a
+   // language option (as opposed to via a pragma or attribute), as
+   // the option -mms-bitfields otherwise essentially makes it impossible
+   // to build C++ code, unless this diagnostic is turned off.
+-  if (Record->isMsStruct(Context) && !Context.getLangOpts().MSBitfields &&
++  if (Context.getLangOpts().getLayoutCompatibility() ==
++          LangOptions::LayoutCompatibilityKind::Default &&
++      Record->isMsStruct(Context) != Context.defaultsToMsStruct() &&
+       (Record->isPolymorphic() || Record->getNumBases())) {
+     Diag(Record->getLocation(), diag::warn_cxx_ms_struct);
+   }
+diff --git clang/test/CodeGen/mingw-long-double.c clang/test/CodeGen/mingw-long-double.c
+index 4be97526f963..0f38de6799e0 100644
+--- clang/test/CodeGen/mingw-long-double.c
++++ clang/test/CodeGen/mingw-long-double.c
+@@ -1,6 +1,6 @@
+ // RUN: %clang_cc1 -triple i686-windows-gnu -emit-llvm -o - %s \
+ // RUN:    | FileCheck %s --check-prefix=GNU32
+-// RUN: %clang_cc1 -triple i686-windows-gnu -emit-llvm -o - %s -mms-bitfields \
++// RUN: %clang_cc1 -triple i686-windows-gnu -emit-llvm -o - %s -fms-layout-compatibility=microsoft \
+ // RUN:    | FileCheck %s --check-prefix=GNU32
+ // RUN: %clang_cc1 -triple x86_64-windows-gnu -emit-llvm -o - %s \
+ // RUN:    | FileCheck %s --check-prefix=GNU64
+diff --git clang/test/CodeGen/mms-bitfields.c clang/test/CodeGen/mms-bitfields.c
+index 49c5c1c3e7d4..43d189a793f7 100644
+--- clang/test/CodeGen/mms-bitfields.c
++++ clang/test/CodeGen/mms-bitfields.c
+@@ -1,4 +1,4 @@
+-// RUN: %clang_cc1 -triple i386-apple-darwin10 -mms-bitfields -emit-llvm %s -o - | FileCheck %s
++// RUN: %clang_cc1 -triple i386-apple-darwin10 -fms-layout-compatibility=microsoft -emit-llvm %s -o - | FileCheck %s
+ 
+ struct s1 {
+   int       f32;
+diff --git clang/test/Driver/ms-bitfields.c clang/test/Driver/ms-bitfields.c
+index 031ed41e2aad..acd1bdc9c0ac 100644
+--- clang/test/Driver/ms-bitfields.c
++++ clang/test/Driver/ms-bitfields.c
+@@ -1,8 +1,15 @@
+-// RUN: %clang -### -target x86_64-linux-gnu %s 2>&1 | FileCheck %s -check-prefix=NO-MSBITFIELDS
+-// RUN: %clang -### -target x86_64-windows-gnu %s 2>&1 | FileCheck %s -check-prefix=MSBITFIELDS
+-// RUN: %clang -### -mno-ms-bitfields -mms-bitfields %s 2>&1 | FileCheck %s -check-prefix=MSBITFIELDS
+-// RUN: %clang -### -mms-bitfields -mno-ms-bitfields %s 2>&1 | FileCheck %s -check-prefix=NO-MSBITFIELDS
++// RUN: %clang -### --target=x86_64-linux-gnu %s 2>&1 | FileCheck %s -check-prefix=DEFAULT-LAYOUT
++// RUN: %clang -### --target=x86_64-windows-gnu %s 2>&1 | FileCheck %s -check-prefix=DEFAULT-LAYOUT
++// RUN: %clang -### --target=x86_64-windows-msvc %s 2>&1 | FileCheck %s -check-prefix=DEFAULT-LAYOUT
++// RUN: %clang -### -mms-bitfields %s 2>&1 | FileCheck %s -check-prefix=MICROSOFT-LAYOUT
++// RUN: %clang -### -mno-ms-bitfields %s 2>&1 | FileCheck %s -check-prefix=ITANIUM-LAYOUT
++// RUN: %clang -### -mno-ms-bitfields -mms-bitfields %s 2>&1 | FileCheck %s -check-prefix=MICROSOFT-LAYOUT
++// RUN: %clang -### -mms-bitfields -mno-ms-bitfields %s 2>&1 | FileCheck %s -check-prefix=ITANIUM-LAYOUT
+ 
+-// MSBITFIELDS: -mms-bitfields
+-// NO-MSBITFIELDS-NOT: -mms-bitfields
++// DEFAULT-LAYOUT-NOT: -fms-layout-compatibility=itanium
++// DEFAULT-LAYOUT-NOT: -fms-layout-compatibility=microsoft
++// MICROSOFT-LAYOUT: -fms-layout-compatibility=microsoft
++// MICROSOFT-LAYOUT-NOT: -fms-layout-compatibility=itanium
++// ITANIUM-LAYOUT: -fms-layout-compatibility=itanium
++// ITANIUM-LAYOUT-NOT: -fms-layout-compatibility=microsoft
+ 
+diff --git clang/test/Layout/itanium-union-bitfield.cpp clang/test/Layout/itanium-union-bitfield.cpp
+index febfc46dfee5..34f501f4b569 100644
+--- clang/test/Layout/itanium-union-bitfield.cpp
++++ clang/test/Layout/itanium-union-bitfield.cpp
+@@ -1,4 +1,4 @@
+-// RUN: %clang_cc1 -emit-llvm-only -triple %itanium_abi_triple -fdump-record-layouts %s 2>/dev/null \
++// RUN: %clang_cc1 -emit-llvm-only -triple %itanium_abi_triple -fms-layout-compatibility=itanium -fdump-record-layouts %s 2>/dev/null \
+ // RUN:            | FileCheck %s
+ 
+ // On z/OS, a bit-field has single byte alignment.  Add aligned(4) on z/OS so the union has
+diff --git clang/test/Misc/pragma-attribute-supported-attributes-list.test clang/test/Misc/pragma-attribute-supported-attributes-list.test
+index e476c15b35de..3fdde9aabf42 100644
+--- clang/test/Misc/pragma-attribute-supported-attributes-list.test
++++ clang/test/Misc/pragma-attribute-supported-attributes-list.test
+@@ -79,6 +79,7 @@
+ // CHECK-NEXT: FlagEnum (SubjectMatchRule_enum)
+ // CHECK-NEXT: Flatten (SubjectMatchRule_function)
+ // CHECK-NEXT: FunctionReturnThunks (SubjectMatchRule_function)
++// CHECK-NEXT: GCCStruct (SubjectMatchRule_record)
+ // CHECK-NEXT: GNUInline (SubjectMatchRule_function)
+ // CHECK-NEXT: HIPManaged (SubjectMatchRule_variable)
+ // CHECK-NEXT: Hot (SubjectMatchRule_function)
+diff --git clang/test/Sema/mms-bitfields.c clang/test/Sema/mms-bitfields.c
+index cee5b0669d25..d0a67a4a3d79 100644
+--- clang/test/Sema/mms-bitfields.c
++++ clang/test/Sema/mms-bitfields.c
+@@ -1,4 +1,4 @@
+-// RUN: %clang_cc1 -mms-bitfields -fsyntax-only -verify -triple x86_64-apple-darwin9 %s
++// RUN: %clang_cc1 -fms-layout-compatibility=microsoft -fsyntax-only -verify -triple x86_64-apple-darwin9 %s
+ // expected-no-diagnostics
+ 
+ // The -mms-bitfields commandline parameter should behave the same
+diff --git clang/test/SemaCXX/ms_struct.cpp clang/test/SemaCXX/ms_struct.cpp
+index 995e424d1f87..29d29e4fd6fd 100644
+--- clang/test/SemaCXX/ms_struct.cpp
++++ clang/test/SemaCXX/ms_struct.cpp
+@@ -1,7 +1,7 @@
+ // RUN: %clang_cc1 -fsyntax-only -DTEST_FOR_WARNING -Wno-error=incompatible-ms-struct -verify -triple i686-apple-darwin9 -std=c++11 %s
+ // RUN: %clang_cc1 -fsyntax-only -DTEST_FOR_WARNING -Wno-error=incompatible-ms-struct -verify -triple armv7-apple-darwin9 -std=c++11 %s
+ // RUN: %clang_cc1 -fsyntax-only -DTEST_FOR_ERROR -verify -triple armv7-apple-darwin9 -std=c++11 %s
+-// RUN: %clang_cc1 -fsyntax-only -DNO_PRAGMA -mms-bitfields -verify -triple armv7-apple-darwin9 -std=c++11 %s
++// RUN: %clang_cc1 -fsyntax-only -DNO_PRAGMA -fms-layout-compatibility=microsoft -verify -triple armv7-apple-darwin9 -std=c++11 %s
+ 
+ #ifndef NO_PRAGMA
+ #pragma ms_struct on
+diff --git clang/test/SemaCXX/ms_wide_bitfield.cpp clang/test/SemaCXX/ms_wide_bitfield.cpp
+index 0dcc787928b0..eccfd90f0faf 100644
+--- clang/test/SemaCXX/ms_wide_bitfield.cpp
++++ clang/test/SemaCXX/ms_wide_bitfield.cpp
+@@ -1,4 +1,4 @@
+-// RUN: %clang_cc1 -fno-rtti -emit-llvm-only -triple i686-pc-win32 -fdump-record-layouts -fsyntax-only -mms-bitfields -verify %s 2>&1
++// RUN: %clang_cc1 -fno-rtti -triple i686-pc-win32 -fdump-record-layouts -fsyntax-only -fms-layout-compatibility=microsoft -verify %s 2>&1
+ 
+ struct A {
+   char a : 9; // expected-error{{width of bit-field 'a' (9 bits) exceeds the size of its type (8 bits)}}
+diff --git clang/utils/TableGen/ClangDiagnosticsEmitter.cpp clang/utils/TableGen/ClangDiagnosticsEmitter.cpp
+index 480c7c83f5f8..fbdf8a567255 100644
+--- clang/utils/TableGen/ClangDiagnosticsEmitter.cpp
++++ clang/utils/TableGen/ClangDiagnosticsEmitter.cpp
+@@ -1218,7 +1218,6 @@ static bool isRemark(const Record &Diag) {
+   return ClsName == "CLASS_REMARK";
+ }
+ 
+-
+ /// ClangDiagsDefsEmitter - The top-level class emits .def files containing
+ /// declarations of Clang diagnostics.
+ void clang::EmitClangDiagsDefs(RecordKeeper &Records, raw_ostream &OS,
+-- 
+2.46.1
+
